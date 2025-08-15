@@ -15,9 +15,6 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 TRIPLET_AUTOTUNE = os.getenv("TRIPLET_AUTOTUNE", "0") == "1"
 
-COMPUTE_PINGPONG = os.getenv("COMPUTE_PINGPONG", "1") == "1"
-
-
 def _get_consumer_config(num_heads):
     # NOTE: dispatch tiling configs of Q based on num_heads
     # Case #1: num_heads = 64, we use one consumer warp group
@@ -82,7 +79,7 @@ def _fwd_inner(
     cid,
     BLOCK_SIZE_KV: tl.constexpr,
     HAS_QK_MASK: tl.constexpr,
-    PING_PONG: tl.constexpr,
+    COMPUTE_PINGPONG: tl.constexpr,
 ):
     # assume num_buffers = 4
     # k2_buf_id = 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
@@ -96,7 +93,7 @@ def _fwd_inner(
     tlx.barrier_wait(k2_full, kv2_phase)
     k2_tile = tlx.local_trans(k2_tile)  # [HEAD_DIM, BLOCK_SIZE_KV]
 
-    if PING_PONG:
+    if COMPUTE_PINGPONG:
         if cid == 0:
             # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(9, 256)
@@ -116,7 +113,7 @@ def _fwd_inner(
 
     qk = tlx.async_dot_wait(0, qk)
 
-    if PING_PONG:
+    if COMPUTE_PINGPONG:
         if cid == 0:
             # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(13, 256)
@@ -142,7 +139,7 @@ def _fwd_inner(
 
     p = p.to(gemm_dtype)  # [BLOCK_M_SPLIT, BLOCK_SIZE_KV]
 
-    if PING_PONG:
+    if COMPUTE_PINGPONG:
         if cid == 0:
             # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
             tlx.named_barrier_arrive(14, 256)
@@ -511,7 +508,7 @@ def _triplet_tlx_fwd_ws_kernel(
                         cid,
                         BLOCK_SIZE_KV,
                         HAS_QK_MASK=has_qk_mask and idx == num_kv2_trips_no_mask,
-                        PING_PONG=COMPUTE_PINGPONG,
+                        COMPUTE_PINGPONG=COMPUTE_PINGPONG,
                     )
 
                     acc_cnt += 1
@@ -634,7 +631,7 @@ def triplet_tlx_fwd_ws(
         BLOCK_M=num_heads,
         NUM_MMA_GROUPS=NUM_MMA_GROUPS,
         NUM_MMA_WARPS=NUM_MMA_WARPS,
-        COMPUTE_PINGPONG=COMPUTE_PINGPONG,
+        COMPUTE_PINGPONG=True,
     )
     return output, m
 
@@ -689,7 +686,7 @@ def _bench():
     w1 = 32
     w2 = 256
 
-    w2s = [256, 512, 1024]
+    w2s = [1024]
     seq_lens = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
     for w2 in w2s:
