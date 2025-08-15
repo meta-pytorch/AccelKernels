@@ -89,7 +89,7 @@ def _fwd_inner(
     # Barrier will wait when the value of barrier and phase is the same
     # Barrier is set to 0 initially
 
-    pl.enter_scope("fwd_inner-QK12 GEMM")
+    pl.enter_scope("[w2-lopp] Q K12 GEMM")
     # wait for the K buffer to be populated by the producer
     tlx.barrier_wait(k2_full, kv2_phase)
     k2_tile = tlx.local_trans(k2_tile)  # [HEAD_DIM, BLOCK_SIZE_KV]
@@ -98,9 +98,9 @@ def _fwd_inner(
     qk = tlx.async_dot_wait(0, qk)
     tlx.barrier_arrive(k2_empty, 1)
 
-    pl.exit_scope("fwd_inner-QK12 GEMM")
+    pl.exit_scope("[w2-lopp] Q K12 GEMM")
 
-    pl.enter_scope("fwd_inner-Softmax")
+    pl.enter_scope("[w2-lopp] Softmax")
 
     # NOTE: mask is only needed for the last iteration of kv2 loop
     if HAS_QK_MASK:
@@ -116,9 +116,9 @@ def _fwd_inner(
     l_i = l_i * alpha + l_ij
     acc = acc * alpha[:, None]
 
-    pl.exit_scope("fwd_inner-Softmax")
+    pl.exit_scope("[w2-lopp] Softmax")
 
-    pl.enter_scope("fwd_inner-PV2GEMM")
+    pl.enter_scope("[w2-lopp] P V2 GEMM")
 
     p = p.to(gemm_dtype)  # [BLOCK_M_SPLIT, BLOCK_SIZE_KV]
 
@@ -128,17 +128,17 @@ def _fwd_inner(
     pv2 = tlx.async_dot_wait(0, pv2)
     tlx.barrier_arrive(v2_empty, 1)
 
-    pl.exit_scope("fwd_inner-PV2GEMM")
+    pl.exit_scope("[w2-lopp] P V2 GEMM")
 
-    pl.enter_scope("fwd_inner-epilogue")
+    pl.enter_scope("[w2-lopp] PV2 V1 elementwise-mul")
 
     pv12 = pv2 * v1_tile_rmem  # [BLOCK_M_SPLIT, HEAD_DIM]
 
     acc += pv12
 
-    pl.exit_scope("fwd_inner-epilogue")
-
     m_i = m_ij
+
+    pl.exit_scope("[w2-lopp] PV2 V1 elementwise-mul")
 
     return acc, m_i, l_i
 
@@ -208,7 +208,7 @@ def _triplet_tlx_fwd_ws_kernel(
         # producer group
         with tlx.async_task("default"):
             # initialize offsets
-            pl.enter_scope("default")
+            pl.enter_scope("[Producer] Load Q,K1,V1,K2,V2 tiles")
             q_idx = tl.program_id(0)
             batch_idx = tl.program_id(1)
 
@@ -304,7 +304,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
                     kv2_offset_y += BLOCK_SIZE_KV
                     acc_cnt += 1
-            pl.exit_scope("default")
+            pl.exit_scope("[Producer] Load Q,K1,V1,K2,V2 tiles")
 
         # consumer group
         with tlx.async_task(
@@ -312,7 +312,7 @@ def _triplet_tlx_fwd_ws_kernel(
             registers=232,
             replicate=NUM_MMA_GROUPS,
         ):
-            pl.enter_scope("prologue-q-tile-loading")
+            pl.enter_scope("[Prologue] Load Q,K1,V1 tiles")
             # prepare offsets
             q_idx = tl.program_id(0)
             batch_idx = tl.program_id(1)
@@ -361,11 +361,11 @@ def _triplet_tlx_fwd_ws_kernel(
             kv2_phase = 1
             acc_cnt = 0
 
-            pl.exit_scope("prologue-q-tile-loading")
+            pl.exit_scope("[Prologue] Load Q,K1,V1 tiles")
 
             for kv1_idx in tl.range(0, num_of_kv1_trips):
 
-                pl.enter_scope("inner-loop-QK1_tile")
+                pl.enter_scope("[w1-loop] Q K1 elementwise-mul")
 
                 k1_tile = tlx.local_view(k1_tiles, kv1_idx)
                 v1_tile = tlx.local_view(v1_tiles, kv1_idx)
@@ -375,7 +375,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
                 qk1_tile_rmem = q_tile_rmem_scaled * k1_tile_rmem
 
-                pl.exit_scope("inner-loop-QK1_tile")
+                pl.exit_scope("[w1-loop] Q K1 elementwise-mul")
 
                 # loop over k, v and update accumulator
                 kv2_idx = kv2_start
@@ -417,7 +417,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
             # epilogue
             # store O
-            pl.enter_scope("epilogue")
+            pl.enter_scope("[epilogue] Scale Acc and Store O")
             acc = acc / l_i[:, None]
             qo_offset_ysplit = (
                 batch_idx * (seq_len * num_heads)
@@ -436,7 +436,7 @@ def _triplet_tlx_fwd_ws_kernel(
                 + q_idx * m_stride_s
             )
             tl.store(M_ptr_start, m)
-            pl.exit_scope("epilogue")
+            pl.exit_scope("[epilogue] Scale Acc and Store O")
 
 
 def get_tensor_descriptor(tensor):
