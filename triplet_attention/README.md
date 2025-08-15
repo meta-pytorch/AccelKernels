@@ -33,7 +33,6 @@ K2 = torch.randn(batch_size, seq_len, 1, head_dim, device=device, dtype=torch.bf
 V1 = torch.randn(batch_size, seq_len, 1, head_dim, device=device, dtype=torch.bfloat16)
 V2 = torch.randn(batch_size, seq_len, 1, head_dim, device=device, dtype=torch.bfloat16)
 
-# Run triplet attention with windowed attention (w1=32, w2=256)
 output, _ = triplet_fwd(Q, K1, K2, V1, V2, w1=32, w2=256)
 ```
 
@@ -42,7 +41,7 @@ output, _ = triplet_fwd(Q, K1, K2, V1, V2, w1=32, w2=256)
 ```python
 from triplet.ops.tlx.fwd_ws import triplet_tlx_fwd_ws
 
-# High-performance TensorLX implementation
+# High-performance TLX implementation
 output, _ = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=32, w2=256)
 ```
 
@@ -51,7 +50,7 @@ output, _ = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=32, w2=256)
 ```python
 from triplet.ops.pytorch.triplet_attention import triplet_attn_fwd_ref
 
-# Reference implementation with different variants
+# Reference implementation
 output = triplet_attn_fwd_ref(
     Q, K1, K2, V1, V2,
     w1=32, w2=256,
@@ -61,8 +60,6 @@ output = triplet_attn_fwd_ref(
 ```
 
 ## Performance
-
-### Benchmarking
 
 Run performance benchmarks:
 
@@ -79,7 +76,3 @@ Run the comprehensive test suite:
 # Run all tests
 python -m pytest tests/ -v
 ```
-
-## License
-
-Copyright (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
