@@ -99,11 +99,11 @@ def quick_calculate(block_m=64, block_kv=128, n=8192, w1=32, w2=512, d=128):
     print("-" * 30)
     print(f"Parameters: M={block_m}, KV={block_kv}, N={n}, W1={w1}, W2={w2}, D={d}")
     print("Tiling Sequence:")
-    print(f"Efficiency: {(1-waste_pct)*100:.2f}%")
-    print(f"Waste: {waste_pct*100:.2f}%")
+    print(f"Efficiency: {(1 - waste_pct) * 100:.2f}%")
+    print(f"Waste: {waste_pct * 100:.2f}%")
     print("Tiling Heads:")
-    print(f"Efficiency: {(1-waste_pct_heads)*100:.2f}%")
-    print(f"Waste: {waste_pct_heads*100:.2f}%")
+    print(f"Efficiency: {(1 - waste_pct_heads) * 100:.2f}%")
+    print(f"Waste: {waste_pct_heads * 100:.2f}%")
     print("\n" * 2)
 
     return waste_pct, waste_pct_heads

@@ -8,7 +8,7 @@ import sys
 import pytest
 import torch
 
-from triplet.utils import compute_sqnr
+from triplet.utils import assert_diff, compute_sqnr
 
 from triplet.ops.tlx.fwd_ws_pingpong import triplet_tlx_fwd_ws
 from triplet.ops.triton.fwd import triplet_fwd as triplet_triton_fwd
@@ -21,11 +21,11 @@ def deterministic_seed():
 
 
 @pytest.mark.parametrize("B", [4])
-@pytest.mark.parametrize("N", [512, 1024, 2028])
+@pytest.mark.parametrize("N", [512, 1024, 2028, 8192])
 @pytest.mark.parametrize("H", [128])
 @pytest.mark.parametrize("D", [128])
 @pytest.mark.parametrize("w1", [16, 32])
-@pytest.mark.parametrize("w2", [128, 256])
+@pytest.mark.parametrize("w2", [128, 256, 512])
 def test_triplet_tlx_fwd_ws_pipelined(B, N, H, D, w1, w2):
     device = torch.accelerator.current_accelerator()
 
@@ -51,12 +51,10 @@ def test_triplet_tlx_fwd_ws_pipelined(B, N, H, D, w1, w2):
     V2 = V2 / torch.norm(V2, dim=-1, keepdim=True)
 
     # Test the pipelined triplet_tlx_fwd_ws kernel
-    out_pipelined, _ = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=w1, w2=w2)
-
-    # out_tlx_baseline, _ = tlx_fwd_baseline(Q, K1, K2, V1, V2, w1=w1, w2=w2)
+    out, m = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=w1, w2=w2)
 
     # Ground truth implementation
-    out_ref, _ = triplet_triton_fwd(
+    out_ref, m_ref = triplet_triton_fwd(
         Q,
         K1,
         K2,
@@ -67,13 +65,12 @@ def test_triplet_tlx_fwd_ws_pipelined(B, N, H, D, w1, w2):
     )
 
     # Compute SQNR loss vs reference
-    sqnr_ref = compute_sqnr(out_pipelined, out_ref)
-    assert (
-        sqnr_ref > 30.0
-    ), f"SQNR vs reference should be larger than 30.0. Got: {sqnr_ref}"
-
-    # Element-wise comparison with reference
-    torch.testing.assert_close(out_pipelined, out_ref, atol=1e-2, rtol=0.0)
+    sqnr_ref = compute_sqnr(out, out_ref)
+    assert sqnr_ref > 40.0, (
+        f"SQNR vs reference should be larger than 30.0. Got: {sqnr_ref}"
+    )
+    assert_diff(out, out_ref)
+    assert_diff(m, m_ref)
 
 
 if __name__ == "__main__":

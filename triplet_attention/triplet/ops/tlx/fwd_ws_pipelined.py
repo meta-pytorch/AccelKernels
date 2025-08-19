@@ -55,7 +55,7 @@ def get_configs():
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook,
         )
-        for BLOCK_SIZE_KV in [64]
+        for BLOCK_SIZE_KV in [128]
         for num_buffers in [2]
     ]
 
@@ -562,7 +562,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
             # store M
             m = m_i + tl.log(l_i)
-            m_offs_k = tl.arange(0, BLOCK_M_SPLIT)
+            m_offs_k = cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
             M_ptr_start = (
                 M_ptr
                 + batch_idx * m_stride_b
@@ -595,9 +595,9 @@ def triplet_tlx_fwd_ws(
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(q.dtype)
     m = torch.zeros((bs, num_heads, seq_len), dtype=torch.float32, device=q.device)
@@ -674,7 +674,6 @@ def _run_bench(
     w1,
     w2,
 ):
-
     total_tensor_core_tflops = get_triplet_tensor_core_tflops(
         bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2
     )

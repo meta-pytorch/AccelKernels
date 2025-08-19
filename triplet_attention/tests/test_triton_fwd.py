@@ -10,7 +10,7 @@ import torch
 from triplet.ops.pytorch.triplet_attention import triplet_attn_fwd_ref
 
 from triplet.ops.triton.fwd import triplet_fwd
-from triplet.utils import compute_sqnr
+from triplet.utils import compute_sqnr, assert_diff
 
 
 @pytest.fixture(autouse=True)
@@ -56,11 +56,10 @@ def test_triplet_triton_fwd(B, N, H, D, w1, w2):
     )
 
     sqnr = compute_sqnr(out, out_ref)
-    assert (
-        sqnr > 30.0
-    ), f"SQNR should be larger than 30.0 for out and out_ref Got: {sqnr}"
-
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=0.0)
+    assert sqnr > 40.0, (
+        f"SQNR should be larger than 30.0 for out and out_ref Got: {sqnr}"
+    )
+    assert_diff(out, out_ref)
 
 
 if __name__ == "__main__":

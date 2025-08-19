@@ -364,7 +364,6 @@ def _triplet_tlx_fwd_ws_kernel(
             pl.exit_scope("[Prologue] Load Q,K1,V1 tiles")
 
             for kv1_idx in tl.range(0, num_of_kv1_trips):
-
                 pl.enter_scope("[w1-loop] Q K1 elementwise-mul")
 
                 k1_tile = tlx.local_view(k1_tiles, kv1_idx)
@@ -462,9 +461,9 @@ def triplet_tlx_fwd_ws(
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(q.dtype)
     m = torch.zeros((bs, num_heads, seq_len), dtype=torch.float32, device=q.device)
@@ -547,7 +546,6 @@ def _run_bench(
     w1,
     w2,
 ):
-
     def _total_tensor_tflops():
         # Tensor Core TFlops: 1 multiply + 1 add = 2
         # Triplet TFlops: 2 multiplies + 1 add = 3
@@ -597,9 +595,7 @@ def _run_bench(
         (bs, seq_len, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
 
-    # fn = lambda:
-
-    out = triplet_tlx_fwd_ws(q, k1, k2, v1, v2, w1, w2)
+    triplet_tlx_fwd_ws(q, k1, k2, v1, v2, w1, w2)
 
     ms = 10
 

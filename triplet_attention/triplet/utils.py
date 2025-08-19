@@ -56,3 +56,12 @@ def compute_sqnr(
     ratio = signal.mean() / (error_power.mean() + eps)
     sqnr_db = 10.0 * torch.log10(ratio).item()
     return round(sqnr_db, 2)
+
+
+def assert_diff(x: torch.Tensor, y: torch.Tensor) -> None:
+    x, y = x.double(), y.double()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    # print(f"{cos_diff=}, {RMSE=}, {amax_diff=}")
+    assert cos_diff < 1e-5, f"assert_diff failed, {cos_diff=}, {RMSE=}, {amax_diff=}"

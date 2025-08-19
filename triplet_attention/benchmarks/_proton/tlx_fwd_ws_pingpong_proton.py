@@ -7,13 +7,15 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+
+import triton.profiler as proton
+import triton.profiler.language as pl
+from triplet.utils import get_triplet_tensor_core_tflops
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 TRIPLET_AUTOTUNE = os.getenv("TRIPLET_AUTOTUNE", "0") == "1"
-
-COMPUTE_PINGPONG = os.getenv("COMPUTE_PINGPONG", "0") == "1"
 
 
 def _get_consumer_config(num_heads):
@@ -80,7 +82,7 @@ def _fwd_inner(
     cid,
     BLOCK_SIZE_KV: tl.constexpr,
     HAS_QK_MASK: tl.constexpr,
-    PING_PONG: tl.constexpr,
+    COMPUTE_PINGPONG: tl.constexpr,
 ):
     # assume num_buffers = 4
     # k2_buf_id = 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
@@ -90,18 +92,17 @@ def _fwd_inner(
     # Barrier will wait when the value of barrier and phase is the same
     # Barrier is set to 0 initially
 
+    pl.enter_scope("[w2-lopp] Q K12 GEMM")
     # wait for the K buffer to be populated by the producer
     tlx.barrier_wait(k2_full, kv2_phase)
     k2_tile = tlx.local_trans(k2_tile)  # [HEAD_DIM, BLOCK_SIZE_KV]
 
-    if PING_PONG:
+    if COMPUTE_PINGPONG:
         if cid == 0:
             # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(9, 256)
         else:
             # Consumer 1 signals its arrival at barrier 9.
-            tlx.named_barrier_arrive(9, 256)
-            # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
             tlx.named_barrier_wait(10, 256)
 
         qk = tlx.async_dot(qk1_tile_rmem, k2_tile, out_dtype=tl.float32)
@@ -109,10 +110,24 @@ def _fwd_inner(
         if cid == 0:
             # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
             tlx.named_barrier_arrive(10, 256)
+        else:
+            tlx.named_barrier_arrive(9, 256)
     else:
         qk = tlx.async_dot(qk1_tile_rmem, k2_tile, out_dtype=tl.float32)
 
     qk = tlx.async_dot_wait(0, qk)
+
+    pl.exit_scope("[w2-lopp] Q K12 GEMM")
+
+    pl.enter_scope("[w2-lopp] Softmax")
+
+    if COMPUTE_PINGPONG:
+        if cid == 0:
+            # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+            tlx.named_barrier_wait(13, 256)
+        else:
+            # Consumer 1 signals its arrival at barrier 9.
+            tlx.named_barrier_wait(14, 256)
 
     # NOTE: mask is only needed for the last iteration of kv2 loop
     if HAS_QK_MASK:
@@ -132,10 +147,26 @@ def _fwd_inner(
 
     p = p.to(gemm_dtype)  # [BLOCK_M_SPLIT, BLOCK_SIZE_KV]
 
+    pl.exit_scope("[w2-lopp] Softmax")
+
+    pl.enter_scope("[w2-lopp] P V2 GEMM")
+
+    if COMPUTE_PINGPONG:
+        if cid == 0:
+            # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+            tlx.named_barrier_arrive(14, 256)
+        else:
+            tlx.named_barrier_arrive(13, 256)
+
     tlx.barrier_wait(v2_full, kv2_phase)
 
     pv2 = tlx.async_dot(p, v2_tile)  # [BLOCK_M_SPLIT, HEAD_DIM]
     pv2 = tlx.async_dot_wait(0, pv2)
+
+    pl.exit_scope("[w2-lopp] P V2 GEMM")
+
+    pl.enter_scope("[w2-lopp] PV2 V1 elementwise-mul")
+
     pv12 = pv2 * v1_tile_rmem  # [BLOCK_M_SPLIT, HEAD_DIM]
 
     acc += pv12
@@ -143,6 +174,8 @@ def _fwd_inner(
     tlx.barrier_arrive(v2_empty, 1)
 
     m_i = m_ij
+
+    pl.exit_scope("[w2-lopp] PV2 V1 elementwise-mul")
 
     return acc, m_i, l_i
 
@@ -213,6 +246,8 @@ def _triplet_tlx_fwd_ws_kernel(
         # producer group
         with tlx.async_task("default"):
             # initialize offsets
+            pl.enter_scope("[Producer] Load Q,K1,V1,K2,V2 tiles")
+
             q_idx = tl.program_id(0)
             batch_idx = tl.program_id(1)
 
@@ -323,12 +358,9 @@ def _triplet_tlx_fwd_ws_kernel(
             )
 
             for kv1_idx in tl.range(num_of_kv1_trips):
-                if kv1_idx == 0:
-                    kv2_offset_y = kv2_offset_y_start + BLOCK_SIZE_KV
-                    _low = kv2_start + BLOCK_SIZE_KV
-                else:
-                    kv2_offset_y = kv2_offset_y_start
-                    _low = kv2_start
+                cond = kv1_idx == 0
+                kv2_offset_y = kv2_offset_y_start + cond * BLOCK_SIZE_KV
+                _low = kv2_start + cond * BLOCK_SIZE_KV
 
                 for _ in tl.range(_low, kv2_end, BLOCK_SIZE_KV):
                     buf_id = acc_cnt % NUM_BUFFERS
@@ -367,6 +399,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
                     kv2_offset_y += BLOCK_SIZE_KV
                     acc_cnt += 1
+            pl.exit_scope("[Producer] Load Q,K1,V1,K2,V2 tiles")
 
         # consumer group
         with tlx.async_task(
@@ -374,13 +407,7 @@ def _triplet_tlx_fwd_ws_kernel(
             registers=232,
             replicate=NUM_MMA_GROUPS,
         ):
-            # one warp = 32 threads
-            # one warpgroup = 4 warps
-            # in WS setup
-            # 1 producer warpgroup
-            # 2 consumer warpgroups
-            # each consumer handle 64x128 Q_tile and 128x128 K_tile
-
+            pl.enter_scope("[Prologue] Load Q,K1,V1 tiles")
             # prepare offsets
             q_idx = tl.program_id(0)
             batch_idx = tl.program_id(1)
@@ -429,14 +456,42 @@ def _triplet_tlx_fwd_ws_kernel(
             kv2_phase = 1
             acc_cnt = 0
 
+            if COMPUTE_PINGPONG:
+                if cid == 1:
+                    tlx.named_barrier_arrive(9, 256)
+                    tlx.named_barrier_arrive(11, 256)
+                    tlx.named_barrier_arrive(13, 256)
+
+            pl.exit_scope("[Prologue] Load Q,K1,V1 tiles")
+
             for kv1_idx in tl.range(0, num_of_kv1_trips):
+                pl.enter_scope("[w1-loop] Q K1 elementwise-mul")
+
                 k1_tile = tlx.local_view(k1_tiles, kv1_idx)
                 v1_tile = tlx.local_view(v1_tiles, kv1_idx)
 
                 k1_tile_rmem = tlx.local_load(k1_tile)
-                v1_tile_rmem = tlx.local_load(v1_tile).to(tl.float32)
+
+                if COMPUTE_PINGPONG:
+                    if cid == 0:
+                        # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+                        tlx.named_barrier_wait(11, 256)
+                    else:
+                        # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+                        tlx.named_barrier_wait(12, 256)
 
                 qk1_tile_rmem = q_tile_rmem_scaled * k1_tile_rmem
+
+                if COMPUTE_PINGPONG:
+                    if cid == 0:
+                        # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+                        tlx.named_barrier_arrive(12, 256)
+                    else:
+                        tlx.named_barrier_arrive(11, 256)
+
+                v1_tile_rmem = tlx.local_load(v1_tile).to(tl.float32)
+
+                pl.exit_scope("[w1-loop] Q K1 elementwise-mul")
 
                 # loop over k, v and update accumulator
                 kv2_idx = kv2_start
@@ -472,7 +527,7 @@ def _triplet_tlx_fwd_ws_kernel(
                         cid,
                         BLOCK_SIZE_KV,
                         HAS_QK_MASK=has_qk_mask and idx == num_kv2_trips_no_mask,
-                        PING_PONG=COMPUTE_PINGPONG and acc_cnt == 0,
+                        COMPUTE_PINGPONG=COMPUTE_PINGPONG,
                     )
 
                     acc_cnt += 1
@@ -480,6 +535,8 @@ def _triplet_tlx_fwd_ws_kernel(
 
             # epilogue
             # store O
+            pl.enter_scope("[epilogue] Scale Acc and Store O")
+
             acc = acc / l_i[:, None]
             qo_offset_ysplit = (
                 batch_idx * (seq_len * num_heads)
@@ -498,6 +555,7 @@ def _triplet_tlx_fwd_ws_kernel(
                 + q_idx * m_stride_s
             )
             tl.store(M_ptr_start, m)
+            pl.exit_scope("[epilogue] Scale Acc and Store O")
 
 
 def get_tensor_descriptor(tensor):
@@ -523,9 +581,9 @@ def triplet_tlx_fwd_ws(
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(q.dtype)
     m = torch.zeros((bs, num_heads, seq_len), dtype=torch.float32, device=q.device)
@@ -595,7 +653,7 @@ def triplet_tlx_fwd_ws(
         BLOCK_M=num_heads,
         NUM_MMA_GROUPS=NUM_MMA_GROUPS,
         NUM_MMA_WARPS=NUM_MMA_WARPS,
-        COMPUTE_PINGPONG=COMPUTE_PINGPONG,
+        COMPUTE_PINGPONG=True,
     )
     return output, m
 
@@ -609,40 +667,9 @@ def _run_bench(
     w1,
     w2,
 ):
-
-    def _total_tensor_tflops():
-        # Tensor Core TFlops: 1 multiply + 1 add = 2
-        # Triplet TFlops: 2 multiplies + 1 add = 3
-        # So we multiply 1.5 of tensor core TFlops to get the triplet TFlops
-
-        QK_GEMM_W1 = bs * num_heads * w1 * head_dim * w1 * w1 * 2
-        QK_GEMM_W1 *= 0.5  # 0.5 is the casual mask ratio for w1
-        QK_GEMM_W1 *= 0.5  # 0.5 is the casual mask ratio for w2
-        total_flops_w1 = (QK_GEMM_W1 * 2) / 1e12
-
-        QK_GEMM_W2 = bs * num_heads * (w2 - w1) * head_dim * w1 * w2 * 2
-        QK_GEMM_W2 *= 0.5  # 0.5 is the casual mask ratio for w2
-        total_flops_w2 = (QK_GEMM_W2 * 2) / 1e12
-
-        # Causal attention for w1 and w2
-        if seq_len <= w1:
-            QK_GEMM = bs * num_heads * seq_len * head_dim * seq_len * seq_len * 2
-            QK_GEMM *= 0.5  # 0.5 is the casual mask ratio for w1
-            QK_GEMM *= 0.5  # 0.5 is the casual mask ratio for w2
-            return (QK_GEMM * 2) / 1e12
-        # # Causal attention for w1 and w2
-        elif seq_len <= w2:
-            current_seq_len = seq_len - w1
-            QK_GEMM = (
-                bs * num_heads * current_seq_len * head_dim * w1 * current_seq_len * 2
-            )
-            QK_GEMM *= 0.5  # 0.5 is the casual mask ratio for w2
-            return (QK_GEMM * 2) / 1e12 + total_flops_w1
-        else:
-            current_seq_len = seq_len - w1 - w2
-            QK_GEMM = bs * num_heads * current_seq_len * head_dim * w1 * w2 * 2
-            return (QK_GEMM * 2) / 1e12 + total_flops_w1 + total_flops_w2
-
+    total_tensor_core_tflops = get_triplet_tensor_core_tflops(
+        bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2
+    )
     q = torch.randn(
         (bs, seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
@@ -659,27 +686,28 @@ def _run_bench(
         (bs, seq_len, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
 
-    fn = lambda: triplet_tlx_fwd_ws(q, k1, k2, v1, v2, w1, w2)
+    triplet_tlx_fwd_ws(q, k1, k2, v1, v2, w1, w2)
 
-    ms = triton.testing.do_bench_cudagraph(fn)
-
+    ms = 10
     secs = ms * 1e-3
 
-    tensor_core_tflops = _total_tensor_tflops() / secs
+    tensor_core_tflops = total_tensor_core_tflops / secs
     triplet_tflops = tensor_core_tflops * 1.5
+
+    del q, k1, k2, v1, v2
 
     return ms, triplet_tflops, tensor_core_tflops
 
 
 def _bench():
-    bs, num_heads, head_dim = 4, 128, 128
+    bs, num_heads, head_dim = 1, 128, 128
     num_kv_heads = 1
 
     w1 = 32
     w2 = 256
 
     w2s = [512]
-    seq_lens = [8192]
+    seq_lens = [512]
 
     for w2 in w2s:
         for seq_len in seq_lens:
@@ -692,4 +720,15 @@ def _bench():
 
 
 if __name__ == "__main__":
+    mode = proton.mode.Default(
+        metric_type="cycle",
+        optimizations="clock32,time_shift",
+        sampling_strategy="selective",
+        sampling_options="0, 4, 8",
+    )
+    proton.start(
+        "fwd-ws-pingpong-proton", data="trace", backend="instrumentation", mode=mode
+    )
+    print("Benchmarking")
     _bench()
+    proton.finalize()

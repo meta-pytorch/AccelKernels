@@ -292,9 +292,9 @@ def triplet_fwd(q, k1, k2, v1, v2, w1, w2, k2_bias=None, v2_bias=None):
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(
         torch.bfloat16

@@ -7,13 +7,13 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-
-from triplet.utils import get_triplet_tensor_core_tflops
 from triton.tools.tensor_descriptor import TensorDescriptor
+from triplet.utils import get_triplet_tensor_core_tflops
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 TRIPLET_AUTOTUNE = os.getenv("TRIPLET_AUTOTUNE", "0") == "1"
+
 
 def _get_consumer_config(num_heads):
     # NOTE: dispatch tiling configs of Q based on num_heads
@@ -79,7 +79,7 @@ def _fwd_inner(
     cid,
     BLOCK_SIZE_KV: tl.constexpr,
     HAS_QK_MASK: tl.constexpr,
-    COMPUTE_PINGPONG: tl.constexpr,
+    PING_PONG: tl.constexpr,
 ):
     # assume num_buffers = 4
     # k2_buf_id = 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
@@ -93,7 +93,7 @@ def _fwd_inner(
     tlx.barrier_wait(k2_full, kv2_phase)
     k2_tile = tlx.local_trans(k2_tile)  # [HEAD_DIM, BLOCK_SIZE_KV]
 
-    if COMPUTE_PINGPONG:
+    if PING_PONG:
         if cid == 0:
             # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(9, 256)
@@ -113,7 +113,7 @@ def _fwd_inner(
 
     qk = tlx.async_dot_wait(0, qk)
 
-    if COMPUTE_PINGPONG:
+    if PING_PONG:
         if cid == 0:
             # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(13, 256)
@@ -139,7 +139,7 @@ def _fwd_inner(
 
     p = p.to(gemm_dtype)  # [BLOCK_M_SPLIT, BLOCK_SIZE_KV]
 
-    if COMPUTE_PINGPONG:
+    if PING_PONG:
         if cid == 0:
             # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
             tlx.named_barrier_arrive(14, 256)
@@ -167,7 +167,7 @@ def _fwd_inner(
     key=["HEAD_DIM", "w1", "w2", "seq_len", "num_heads"],
 )
 @triton.jit
-def _triplet_tlx_fwd_ws_kernel(
+def _triplet_tlx_fwd_ws_kernel_pingpong(
     desc_q,  # [b, s, k, h]
     desc_k1,  # [b, s, 1, h]
     desc_k2,  # [b, s, 1, h]
@@ -337,12 +337,9 @@ def _triplet_tlx_fwd_ws_kernel(
             )
 
             for kv1_idx in tl.range(num_of_kv1_trips):
-                if kv1_idx == 0:
-                    kv2_offset_y = kv2_offset_y_start + BLOCK_SIZE_KV
-                    _low = kv2_start + BLOCK_SIZE_KV
-                else:
-                    kv2_offset_y = kv2_offset_y_start
-                    _low = kv2_start
+                cond = kv1_idx == 0
+                kv2_offset_y = kv2_offset_y_start + cond * BLOCK_SIZE_KV
+                _low = kv2_start + cond * BLOCK_SIZE_KV
 
                 for _ in tl.range(_low, kv2_end, BLOCK_SIZE_KV):
                     buf_id = acc_cnt % NUM_BUFFERS
@@ -508,7 +505,7 @@ def _triplet_tlx_fwd_ws_kernel(
                         cid,
                         BLOCK_SIZE_KV,
                         HAS_QK_MASK=has_qk_mask and idx == num_kv2_trips_no_mask,
-                        COMPUTE_PINGPONG=COMPUTE_PINGPONG,
+                        PING_PONG=COMPUTE_PINGPONG,
                     )
 
                     acc_cnt += 1
@@ -526,7 +523,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
             # store M
             m = m_i + tl.log(l_i)
-            m_offs_k = tl.arange(0, BLOCK_M_SPLIT)
+            m_offs_k = cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
             M_ptr_start = (
                 M_ptr
                 + batch_idx * m_stride_b
@@ -559,9 +556,9 @@ def triplet_tlx_fwd_ws(
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(q.dtype)
     m = torch.zeros((bs, num_heads, seq_len), dtype=torch.float32, device=q.device)
@@ -611,7 +608,7 @@ def triplet_tlx_fwd_ws(
 
     NUM_MMA_GROUPS, NUM_MMA_WARPS = _get_consumer_config(num_heads)
 
-    _triplet_tlx_fwd_ws_kernel[grid](
+    _triplet_tlx_fwd_ws_kernel_pingpong[grid](
         desc_q,
         desc_k1,
         desc_k2,
@@ -645,10 +642,6 @@ def _run_bench(
     w1,
     w2,
 ):
-
-    total_tensor_core_tflops = get_triplet_tensor_core_tflops(
-        bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2
-    )
     q = torch.randn(
         (bs, seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
@@ -671,10 +664,13 @@ def _run_bench(
 
     secs = ms * 1e-3
 
-    tensor_core_tflops = total_tensor_core_tflops / secs
+    tensor_core_tflops = (
+        get_triplet_tensor_core_tflops(
+            bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2
+        )
+        / secs
+    )
     triplet_tflops = tensor_core_tflops * 1.5
-
-    del q, k1, k2, v1, v2
 
     return ms, triplet_tflops, tensor_core_tflops
 
@@ -684,9 +680,8 @@ def _bench():
     num_kv_heads = 1
 
     w1 = 32
-    w2 = 256
 
-    w2s = [1024]
+    w2s = [512, 1024]
     seq_lens = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
     for w2 in w2s:

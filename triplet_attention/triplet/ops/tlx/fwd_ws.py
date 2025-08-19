@@ -93,6 +93,7 @@ def _fwd_inner(
 
     qk = tlx.async_dot(qk1_tile_rmem, k2_tile, out_dtype=tl.float32)
     qk = tlx.async_dot_wait(0, qk)
+    tlx.barrier_arrive(k2_empty, 1)
 
     # NOTE: mask is only needed for the last iteration of kv2 loop
     if HAS_QK_MASK:
@@ -100,8 +101,6 @@ def _fwd_inner(
         kv2_mask = kv2_offs <= q_idx
         qk_mask = kv2_mask[None, :]
         qk = tl.where(qk_mask, qk, -1.0e6)
-
-    tlx.barrier_arrive(k2_empty, 1)
 
     m_ij = tl.maximum(m_i, tl.max(qk, 1))
     p = tl.math.exp2(qk - m_ij[:, None])
@@ -116,11 +115,11 @@ def _fwd_inner(
 
     pv2 = tlx.async_dot(p, v2_tile)  # [BLOCK_M_SPLIT, HEAD_DIM]
     pv2 = tlx.async_dot_wait(0, pv2)
+    tlx.barrier_arrive(v2_empty, 1)
+
     pv12 = pv2 * v1_tile_rmem  # [BLOCK_M_SPLIT, HEAD_DIM]
 
     acc += pv12
-
-    tlx.barrier_arrive(v2_empty, 1)
 
     m_i = m_ij
 
@@ -392,6 +391,7 @@ def _triplet_tlx_fwd_ws_kernel(
             # epilogue
             # store O
             acc = acc / l_i[:, None]
+
             qo_offset_ysplit = (
                 batch_idx * (seq_len * num_heads)
                 + q_idx * num_heads
@@ -401,7 +401,7 @@ def _triplet_tlx_fwd_ws_kernel(
 
             # store M
             m = m_i + tl.log(l_i)
-            m_offs_k = tl.arange(0, BLOCK_M_SPLIT)
+            m_offs_k = cid * BLOCK_M_SPLIT + tl.arange(0, BLOCK_M_SPLIT)
             M_ptr_start = (
                 M_ptr
                 + batch_idx * m_stride_b
@@ -434,9 +434,9 @@ def triplet_tlx_fwd_ws(
     bs, seq_len, num_heads, head_dim = q.shape
     _, seq_len1, _, _ = k1.shape
     _, seq_len2, _, _ = k2.shape
-    assert (
-        seq_len == seq_len1 and seq_len1 == seq_len2
-    ), "input seq lens must match, sliding window is done within kernel"
+    assert seq_len == seq_len1 and seq_len1 == seq_len2, (
+        "input seq lens must match, sliding window is done within kernel"
+    )
     assert w1 > 0 and w2 > 0, "block local windows must be positive"
     output = torch.zeros_like(q, memory_format=torch.contiguous_format).to(q.dtype)
     m = torch.zeros((bs, num_heads, seq_len), dtype=torch.float32, device=q.device)
@@ -519,7 +519,6 @@ def _run_bench(
     w1,
     w2,
 ):
-
     total_tensor_core_tflops = get_triplet_tensor_core_tflops(
         bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2
     )
@@ -554,7 +553,7 @@ def _run_bench(
 
 
 try:
-    from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (
+    from flash_attn_interface import (
         flash_attn_func as fa3,
     )
 except ImportError:
@@ -563,18 +562,20 @@ except ImportError:
 
 
 def _run_bench_fa3(bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2):
-
     if fa3 is None:
         return -1.0, -1.0
+
+    kv_length = w1 * w2
+    IS_CAUSAL = False
 
     q = torch.randn(
         (bs, seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
     k = torch.randn(
-        (bs, w1 * w2, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+        (bs, kv_length, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
     v = torch.randn(
-        (bs, w1 * w2, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+        (bs, kv_length, num_kv_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
     )
 
     def _total_tensor_tflops():
@@ -582,10 +583,15 @@ def _run_bench_fa3(bs, seq_len, num_heads, num_kv_heads, head_dim, w1, w2):
         # Triplet TFlops: 2 multiplies + 1 add = 3
         # So we multiply 1.5 of tensor core TFlops to get the triplet TFlops
 
-        QK_GEMM_W1 = bs * num_heads * seq_len * head_dim * w1 * w2 * 2
-        return QK_GEMM_W1 * 2 / 1e12
+        QK_GEMM_W1 = bs * num_heads * seq_len * head_dim * kv_length * 2
 
-    fn = lambda: fa3(q, k, v, causal=False)
+        RATIO = 1.0
+        if IS_CAUSAL:
+            RATIO *= 0.5
+
+        return QK_GEMM_W1 * 2 / 1e12 * RATIO
+
+    fn = lambda: fa3(q, k, v, causal=IS_CAUSAL)
 
     ms = triton.testing.do_bench_cudagraph(fn)
     secs = ms * 1e-3

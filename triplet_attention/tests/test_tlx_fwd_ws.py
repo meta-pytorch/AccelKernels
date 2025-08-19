@@ -6,14 +6,13 @@
 import sys
 
 
-
 import pytest
 import torch
 
 from triplet.ops.pytorch.triplet_attention import triplet_attn_fwd_ref
 from triplet.ops.tlx.fwd_ws import triplet_tlx_fwd_ws
-from triplet.utils import compute_sqnr
-
+from triplet.utils import compute_sqnr, assert_diff
+from triplet.ops.triton.fwd import triplet_fwd as triplet_triton_fwd
 
 
 @pytest.fixture(autouse=True)
@@ -53,9 +52,10 @@ def test_triplet_tlx_fwd_ws(B, N, H, D, w1, w2):
     V2 = V2 / torch.norm(V2, dim=-1, keepdim=True)
 
     # Test the triplet_tlx_fwd_ws kernel
-    out, _ = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=w1, w2=w2)
+    out, m = triplet_tlx_fwd_ws(Q, K1, K2, V1, V2, w1=w1, w2=w2)
 
-    # Ground truth implementation
+    _, m_ref = triplet_triton_fwd(Q, K1, K2, V1, V2, w1=w1, w2=w2)
+
     out_ref = triplet_attn_fwd_ref(
         Q,
         K1,
@@ -68,14 +68,17 @@ def test_triplet_tlx_fwd_ws(B, N, H, D, w1, w2):
         disable_kv_bias=True,
     )
 
-    # Compute SQNR loss
-    sqnr = compute_sqnr(out, out_ref)
-    assert (
-        sqnr > 25.0
-    ), f"SQNR should be larger than 30.0 for out and out_ref Got: {sqnr}"
+    sqnr_m = compute_sqnr(m, m_ref)
+    assert sqnr_m > 50.0, (
+        f"SQNR should be larger than 30.0 for m and m_ref Got: {sqnr_m}"
+    )
 
-    # Element-wise comparison
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=0.0)
+    sqnr = compute_sqnr(out, out_ref)
+    assert sqnr > 50.0, (
+        f"SQNR should be larger than 30.0 for out and out_ref Got: {sqnr}"
+    )
+    assert_diff(out, out_ref)
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
