@@ -7,7 +7,7 @@ import torch
 import triton
 
 try:
-    from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (
+    from flash_attn_interface import (
         flash_attn_func as fa3,
     )
 
@@ -18,6 +18,9 @@ except ImportError:
     HAS_FA3 = False
 
 from triplet.ops.tlx.fwd_ws import triplet_tlx_fwd_ws as tlx_fwd_ws
+from triplet.ops.tlx.fwd_ws_pingpong import (
+    triplet_tlx_fwd_ws as tlx_fwd_ws_pingpong,
+)
 from triplet.ops.triton.fwd import triplet_fwd as triton_fwd
 from triplet.utils import get_triplet_tensor_core_tflops
 
@@ -44,20 +47,23 @@ N_W2_Hq_SHAPES = [(n, w2, hq) for hq in Hqs for w2 in W2s for n in Ns]
             line_vals=[
                 "triton_fwd",
                 "tlx_fwd_ws",
+                "tlx_fwd_ws_pingpong",
                 "fa3_fwd",
             ],
             line_names=[
                 "triton_fwd",
                 "tlx_fwd_ws",
+                "tlx_fwd_ws_pingpong",
                 "fa3_fwd",
             ],
             styles=[
                 ("red", "-"),
                 ("yellow", "-"),
                 ("blue", "-"),
+                ("green", "-"),
             ],
             ylabel="Latency (ms)",
-            plot_name=f"Triplet Attention Benchmark (tflops/s): {B=} {Hk=} {D=} {W1=}",
+            plot_name=f"triplet-benchmark-{B=}-{Hk=}-{D=}-{W1=}-tflops",
             args={
                 "B": B,  # batch
                 "Hk": Hk,  # kv_heads
@@ -74,7 +80,11 @@ def _benchmark(B, N, w2, Hq, Hk, D, w1, provider):
     Q = torch.randn(B, N, Hq, D, device=device, dtype=torch.bfloat16)
 
     IS_CAUSAL = False
-    KV_LEN_2D = w1 + w2
+    KV_LEN_2D = w1 * w2
+
+    if provider == "tlx_fwd_ws_pingpong" and Hq != 128:
+        # `pingpong` only supports Hq=128 for 2 consumer warpgroups
+        return -1.0
 
     if provider == "fa3_fwd":
         if not HAS_FA3:
@@ -113,10 +123,14 @@ def _benchmark(B, N, w2, Hq, Hk, D, w1, provider):
     def _tlx_fwd_ws():
         return tlx_fwd_ws(Q, K1, K2, V1, V2, w1=w1, w2=w2)
 
+    def _tlx_fwd_ws_pingpong():
+        return tlx_fwd_ws_pingpong(Q, K1, K2, V1, V2, w1=w1, w2=w2)
+
     NAME_TO_FN = {
         "fa3_fwd": _fa3_fwd if HAS_FA3 else None,
         "triton_fwd": _triton_fwd,
         "tlx_fwd_ws": _tlx_fwd_ws,
+        "tlx_fwd_ws_pingpong": _tlx_fwd_ws_pingpong,
     }
 
     ms = triton.testing.do_bench_cudagraph(NAME_TO_FN[provider])
@@ -125,8 +139,7 @@ def _benchmark(B, N, w2, Hq, Hk, D, w1, provider):
 
 
 def main():
-    _benchmark.run(show_plots=False, print_data=True)
-
+    _benchmark.run(save_path=".", show_plots=False, print_data=True)
 
 if __name__ == "__main__":
     main()
