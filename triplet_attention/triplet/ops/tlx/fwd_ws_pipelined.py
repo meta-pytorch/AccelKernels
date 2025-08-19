@@ -203,7 +203,7 @@ def qk_gemm_online_softmax_pv_gemm(
     key=["HEAD_DIM", "w1", "w2", "seq_len", "num_heads"],
 )
 @triton.jit
-def _triplet_tlx_fwd_ws_kernel(
+def _triplet_tlx_fwd_ws_kernel_pipelined(
     desc_q,  # [b, s, k, h]
     desc_k1,  # [b, s, 1, h]
     desc_k2,  # [b, s, 1, h]
@@ -641,7 +641,7 @@ def triplet_tlx_fwd_ws(
 
     NUM_MMA_GROUPS, NUM_MMA_WARPS = _get_consumer_config(num_heads)
 
-    _triplet_tlx_fwd_ws_kernel[grid](
+    _triplet_tlx_fwd_ws_kernel_pipelined[grid](
         desc_q,
         desc_k1,
         desc_k2,

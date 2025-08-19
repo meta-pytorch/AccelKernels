@@ -112,13 +112,12 @@ def _fwd_inner(
         qk = tlx.async_dot(qk1_tile_rmem, k2_tile, out_dtype=tl.float32)
 
     qk = tlx.async_dot_wait(0, qk)
+    tlx.barrier_arrive(k2_empty, 1)
 
     if PING_PONG:
         if cid == 0:
-            # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
             tlx.named_barrier_wait(13, 256)
         else:
-            # Consumer 1 signals its arrival at barrier 9.
             tlx.named_barrier_wait(14, 256)
 
     # NOTE: mask is only needed for the last iteration of kv2 loop
@@ -127,8 +126,6 @@ def _fwd_inner(
         kv2_mask = kv2_offs <= q_idx
         qk_mask = kv2_mask[None, :]
         qk = tl.where(qk_mask, qk, -1.0e6)
-
-    tlx.barrier_arrive(k2_empty, 1)
 
     m_ij = tl.maximum(m_i, tl.max(qk, 1))
     p = tl.math.exp2(qk - m_ij[:, None])
@@ -141,7 +138,6 @@ def _fwd_inner(
 
     if PING_PONG:
         if cid == 0:
-            # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
             tlx.named_barrier_arrive(14, 256)
         else:
             tlx.named_barrier_arrive(13, 256)
@@ -150,11 +146,11 @@ def _fwd_inner(
 
     pv2 = tlx.async_dot(p, v2_tile)  # [BLOCK_M_SPLIT, HEAD_DIM]
     pv2 = tlx.async_dot_wait(0, pv2)
+    tlx.barrier_arrive(v2_empty, 1)
+
     pv12 = pv2 * v1_tile_rmem  # [BLOCK_M_SPLIT, HEAD_DIM]
 
     acc += pv12
-
-    tlx.barrier_arrive(v2_empty, 1)
 
     m_i = m_ij
 
@@ -245,7 +241,7 @@ def _triplet_tlx_fwd_ws_kernel_pingpong(
             # Let's assume
             # --- c0 and c1 means consumer 0 and consumer 1
             # --- b0, b1 means buffer 0 and buffer 1
-            # Non-PingPong Producer Loading
+            # Non-PingPong Producer Loading with 2 buffers
             # - Q[c0], Q[c1]
             # - K2[b0], V2[b0], K2[b1], V2[b1], K2[b0], V2[b0], K2[b1], V2[b1], ....
             # PingPong Producer Loading
@@ -286,10 +282,10 @@ def _triplet_tlx_fwd_ws_kernel_pingpong(
 
             # Load K2[b0]
             buf_id = acc_cnt % NUM_BUFFERS
-            # buffers in a row share the same phase
+            # buffers in the same round will share the same phase
             kv_phase = kv_phase ^ (buf_id == 0)
             # 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1
-            # here the phase is for empty
+            # here the phase is for empty barriers
 
             # wait for the K buffer to be released by the consumer
             k_empty = tlx.local_view(k2_empties, buf_id)
@@ -343,15 +339,13 @@ def _triplet_tlx_fwd_ws_kernel_pingpong(
 
                 for _ in tl.range(_low, kv2_end, BLOCK_SIZE_KV):
                     buf_id = acc_cnt % NUM_BUFFERS
-                    # buffers in a row share the same phase
+                    # buffers in the same round will share the same phase
                     kv_phase = kv_phase ^ (buf_id == 0)
                     # 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1
-                    # here the phase is for empty
+                    # here the phase is for empty barriers
 
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(k2_empties, buf_id)
-                    # pass when the value of barrier and phase is different
-                    # wait when the value of barrier and phase is the same
                     tlx.barrier_wait(k_empty, kv_phase)
                     # load K
                     k2_full = tlx.local_view(k2_fulls, buf_id)
@@ -390,7 +384,7 @@ def _triplet_tlx_fwd_ws_kernel_pingpong(
             # in WS setup
             # 1 producer warpgroup
             # 2 consumer warpgroups
-            # each consumer handle 64x128 Q_tile and 128x128 K_tile
+            # each consumer handle one 64x128 Q_TILE
 
             # prepare offsets
             q_idx = tl.program_id(0)
@@ -454,17 +448,14 @@ def _triplet_tlx_fwd_ws_kernel_pingpong(
 
                 if COMPUTE_PINGPONG:
                     if cid == 0:
-                        # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
                         tlx.named_barrier_wait(11, 256)
                     else:
-                        # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
                         tlx.named_barrier_wait(12, 256)
 
                 qk1_tile_rmem = q_tile_rmem_scaled * k1_tile_rmem
 
                 if COMPUTE_PINGPONG:
                     if cid == 0:
-                        # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
                         tlx.named_barrier_arrive(12, 256)
                     else:
                         tlx.named_barrier_arrive(11, 256)

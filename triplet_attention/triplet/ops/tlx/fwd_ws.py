@@ -251,15 +251,15 @@ def _triplet_tlx_fwd_ws_kernel(
                 kv2_offset_y = kv2_offset_y_start
                 for _ in tl.range(kv2_start, kv2_end, BLOCK_SIZE_KV):
                     buf_id = acc_cnt % NUM_BUFFERS
-                    # buffers in a row share the same phase
+                    # buffers in the same round will share the same phase
                     kv_phase = kv_phase ^ (buf_id == 0)
                     # 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1
-                    # here the phase is for empty
+                    # here the phase is for empty barriers
 
                     # wait for the K buffer to be released by the consumer
                     k_empty = tlx.local_view(k2_empties, buf_id)
-                    # pass when the value of barrier and phase is different
-                    # wait when the value of barrier and phase is the same
+                    # barrier_wait pass when the value of barrier and phase is different
+                    # barrier_wait block when the value of barrier and phase is the same
                     tlx.barrier_wait(k_empty, kv_phase)
                     # load K
                     k2_full = tlx.local_view(k2_fulls, buf_id)
