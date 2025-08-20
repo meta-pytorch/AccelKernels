@@ -69,7 +69,7 @@ def _gqa_pack_fwd_inner(
     v2_offs = kv2_offs_s[:, None] * v2_stride_s + qkv_offs_h[None, :] * v2_stride_h
 
     if IS_MASK_LOAD:
-        kv2_mask_s = q_idx - w2 < kv2_offs_s and kv2_offs_s <= q_idx
+        kv2_mask_s = (q_idx - w2 < kv2_offs_s) and (kv2_offs_s <= q_idx)
         k2t_tile = tl.load(
             K2_ptr + k2_offs, mask=kv2_mask_s[None, :]
         )  # [HEAD_DIM, BLOCK_SIZE_KV]
@@ -104,15 +104,18 @@ def _gqa_pack_fwd_inner(
     alpha = tl.math.exp2(m_i - m_ij)
     l_i = l_i * alpha + l_ij
     acc = acc * alpha[:, None]
-    v12_tile = v1_tile * v2_tile  # [BLOCK_SIZE_KV, HEAD_DIM]
 
     # v12T[d, kv2] @ pT[kv2, q]: accT[d, q]
-    acc += tl.dot(
+    pv2 = tl.dot(
         p.to(gemm_dtype),
-        v12_tile,
+        v2_tile,
         input_precision="ieee",  # INPUT_PRECISION,
         out_dtype=tl.float32,
     )
+
+    pv12 = pv2 * v1_tile  # [BLOCK_SIZE_KV, HEAD_DIM]
+
+    acc += pv12
 
     m_i = m_ij
 
