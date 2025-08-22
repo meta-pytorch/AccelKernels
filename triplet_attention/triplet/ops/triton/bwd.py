@@ -4,6 +4,8 @@
 
 import os
 
+import torch
+
 import triton  # @manual  # @manual
 
 import triton.language as tl  # @manual  # @manual
@@ -650,3 +652,112 @@ def triplet_bwd_kv2q_triton(
             SM_SCALE=sm_scale,
             IS_SECOND_PASS=is_second_pass,
         )
+
+
+@triton.jit
+def triplet_bwd_pre_kernel(
+    O_ptr,  # [b, s, k, h]
+    dO_ptr,  # [b, s, k, h]
+    d_ptr,  # [b, k, s]
+    bs,
+    seq_len,
+    num_heads,
+    head_dim,
+    o_stride_b,
+    o_stride_s,
+    o_stride_k,
+    o_stride_h,
+    dO_stride_b,
+    dO_stride_s,
+    dO_stride_k,
+    dO_stride_h,
+    d_stride_b,
+    d_stride_k,
+    d_stride_s,
+    BLOCK_SIZE_S: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,  # Expect BLOCK_SIZE_H = h
+):
+    offs_s = tl.program_id(0) * BLOCK_SIZE_S + tl.arange(0, BLOCK_SIZE_S)
+
+    bk = tl.program_id(1)
+    offs_b = bk // num_heads
+    offs_k = bk % num_heads
+
+    O_ptr += offs_b * o_stride_b + offs_k * o_stride_k
+    dO_ptr += offs_b * dO_stride_b + offs_k * dO_stride_k
+    d_ptr += offs_b * dO_stride_b + offs_k * d_stride_k
+
+    offs_h = tl.arange(0, BLOCK_SIZE_H)
+    mask_h = offs_h < head_dim
+
+    o_offs = offs_s[:, None] * o_stride_s + offs_h[None, :] * o_stride_h
+    dO_offs = offs_s[:, None] * dO_stride_s + offs_h[None, :] * o_stride_h
+    d_offs = offs_s * d_stride_s
+    mask_s = offs_s < seq_len
+    mask = mask_s[:, None] & mask_h[None, :]
+
+    o = tl.load(O_ptr + o_offs, mask=mask)  # [BLOCK_SIZE_S, BLOCK_SIZE_H]
+    dO = tl.load(dO_ptr + dO_offs, mask=mask)  # [BLOCK_SIZE_S, BLOCK_SIZE_H]
+
+    delta = tl.sum(o * dO, -1)
+
+    tl.store(d_ptr + d_offs, delta, mask=mask_s)
+
+
+def triplet_bwd_pre_triton(o, dO):
+    bs, seq_len, num_heads, head_dim = o.shape
+    d = torch.zeros((bs, num_heads, seq_len), dtype=o.dtype, device=o.device)
+    grid = lambda args: (triton.cdiv(seq_len, args["BLOCK_SIZE_S"]), bs * num_heads)
+
+    # d = sum(o * dO, dim=-1)
+    triplet_bwd_pre_kernel[grid](
+        o,
+        dO,
+        d,
+        bs,
+        seq_len,
+        num_heads,
+        head_dim,
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        dO.stride(0),
+        dO.stride(1),
+        dO.stride(2),
+        dO.stride(3),
+        d.stride(0),
+        d.stride(1),
+        d.stride(2),
+        BLOCK_SIZE_S=32,
+        BLOCK_SIZE_H=triton.next_power_of_2(head_dim),
+    )
+    return d
+
+
+def triplet_bwd(q, k1, k2, v1, v2, o, dO, m, w1, w2, k2_bias=None, v2_bias=None):
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    dk1 = torch.zeros_like(k1)
+    dk2 = torch.zeros_like(k2)
+    dv1 = torch.zeros_like(v1)
+    dv2 = torch.zeros_like(v2)
+
+    bs, seq_len, num_heads, head_dim = q.shape
+    sm_scale = head_dim**-0.5
+    if not k2_bias:
+        k2_bias = 1.0 / head_dim
+    if not v2_bias:
+        v2_bias = 1.0
+
+    d = triplet_bwd_pre_triton(o, dO)
+
+    triplet_bwd_kv1_triton(
+        q, k1, k2, v1, v2, dO, m, d, w1, w2, dk1, dv1, None, sm_scale=sm_scale
+    )
+
+    assert w2 == 32
+    triplet_bwd_kv2q_triton(
+        q, k1, k2, v1, v2, dO, m, d, w1, w2, dk2, dv2, dq, sm_scale=sm_scale
+    )
+
+    return dq, dk1, dk2, dv1, dv2

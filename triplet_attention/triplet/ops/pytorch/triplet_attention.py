@@ -10,6 +10,101 @@ import math
 
 import torch
 import torch.nn.functional as F
+from triplet.ops.triton.bwd import triplet_bwd
+
+from triplet.ops.triton.fwd import triplet_fwd
+
+
+class TripletAttention(torch.nn.Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_heads: int,
+        w1: int = 512,
+        w2: int = 32,
+    ):
+        super().__init__()
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.w1 = w1
+        self.w2 = w2
+
+    def forward(
+        self,
+        xq: torch.Tensor,
+        xk1: torch.Tensor,
+        xk2: torch.Tensor,
+        xv1: torch.Tensor,
+        xv2: torch.Tensor,
+    ):
+        bs, slen, _ = xq.shape
+
+        xq = xq.view(bs, slen, self.n_heads, self.head_dim)
+        xk1 = xk1.view(bs, slen, self.n_heads, self.head_dim)
+        xk2 = xk2.view(bs, slen, self.n_heads, self.head_dim)
+        xv1 = xv1.view(bs, slen, self.n_heads, self.head_dim)
+        xv2 = xv2.view(bs, slen, self.n_heads, self.head_dim)
+
+        output = TripletAttentionFunction.apply(
+            xq,
+            xk1,
+            xk2,
+            xv1,
+            xv2,
+            self.w1,
+            self.w2,
+        )
+        output = output.reshape(bs, slen, -1)
+        return output
+
+
+class TripletAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        xq: torch.Tensor,
+        xk1: torch.Tensor,
+        xk2: torch.Tensor,
+        xv1: torch.Tensor,
+        xv2: torch.Tensor,
+        w1: int,
+        w2: int,
+    ):
+        output, max_plus_lse = triplet_fwd(xq, xk1, xk2, xv1, xv2, w1, w2)
+        ctx.w1 = w1
+        ctx.w2 = w2
+        ctx.save_for_backward(xq, xk1, xk2, xv1, xv2, output, max_plus_lse)
+
+        return output
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,
+    ):
+        q, k1, k2, v1, v2, output, max_plus_lse = ctx.saved_tensors
+        dq, dk1, dk2, dv1, dv2 = triplet_bwd(
+            q,
+            k1,
+            k2,
+            v1,
+            v2,
+            ctx.w1,
+            ctx.w2,
+            output,
+            grad_output,
+            max_plus_lse,
+        )
+
+        return (
+            dq,
+            dk1,
+            dk2,
+            dv1,
+            dv2,
+            None,
+            None,
+        )
 
 
 # ======================= Forward passes. =======================
